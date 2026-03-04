@@ -7,9 +7,20 @@ namespace Flue.Infrastructure.Parsing;
 public sealed class TemplateParser : ITemplateParser
 {
     private static readonly FrozenDictionary<string, string> EmptyAttributes =
-        new Dictionary<string, string>().ToFrozenDictionary(StringComparer.Ordinal);
+        new Dictionary<string, string>().ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
 
-    public TemplateNode Parse(string templateContent)
+    private static readonly FrozenSet<string> TextTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "span", "p", "label", "small", "strong", "em", "b", "i",
+        "h1", "h2", "h3", "h4", "h5", "h6"
+    }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly FrozenSet<string> FlexCapableTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "div", "header", "footer", "main", "section", "article", "nav", "aside", "form"
+    }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+
+    public TemplateNode Parse (string templateContent)
     {
         var document = new HtmlDocument();
         document.LoadHtml($"<flue-root>{templateContent}</flue-root>");
@@ -28,7 +39,7 @@ public sealed class TemplateParser : ITemplateParser
             children);
     }
 
-    private static IEnumerable<TemplateNode> ParseNode(HtmlNode node)
+    private static IEnumerable<TemplateNode> ParseNode (HtmlNode node)
     {
         if (node.NodeType is HtmlNodeType.Comment)
         {
@@ -60,8 +71,8 @@ public sealed class TemplateParser : ITemplateParser
 
         var classTokens = ParseClasses(node.GetAttributeValue("class", string.Empty));
         var attributes = node.Attributes
-            .ToDictionary(attribute => attribute.Name, attribute => attribute.Value, StringComparer.Ordinal)
-            .ToFrozenDictionary(StringComparer.Ordinal);
+            .ToDictionary(attribute => attribute.Name, attribute => attribute.Value, StringComparer.OrdinalIgnoreCase)
+            .ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
 
         var kind = ResolveKind(node.Name, classTokens);
         if (kind is WidgetKind.Text)
@@ -95,41 +106,44 @@ public sealed class TemplateParser : ITemplateParser
             children);
     }
 
-    private static ImmutableArray<string> ParseClasses(string classValue)
+    private static ImmutableArray<string> ParseClasses (string classValue)
     {
         if (string.IsNullOrWhiteSpace(classValue))
         {
             return ImmutableArray<string>.Empty;
         }
 
-        return classValue
+        return [.. classValue
             .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Distinct(StringComparer.Ordinal)
-            .ToImmutableArray();
+            .Distinct(StringComparer.Ordinal)];
     }
 
-    private static WidgetKind ResolveKind(string tagName, ImmutableArray<string> classes)
+    private static WidgetKind ResolveKind (string tagName, ImmutableArray<string> classes)
     {
-        if (tagName.Equals("span", StringComparison.OrdinalIgnoreCase) ||
-            tagName.Equals("p", StringComparison.OrdinalIgnoreCase))
+        if (tagName.Equals("button", StringComparison.OrdinalIgnoreCase))
+        {
+            return WidgetKind.Button;
+        }
+
+        if (TextTags.Contains(tagName))
         {
             return WidgetKind.Text;
         }
 
-        if (!tagName.Equals("div", StringComparison.OrdinalIgnoreCase))
+        if (FlexCapableTags.Contains(tagName))
         {
+            var classSet = classes.ToHashSet(StringComparer.Ordinal);
+            if (classSet.Contains("flex-col"))
+            {
+                return WidgetKind.Column;
+            }
+
+            if (classSet.Contains("flex-row") || classSet.Contains("flex"))
+            {
+                return WidgetKind.Row;
+            }
+
             return WidgetKind.Container;
-        }
-
-        var classSet = classes.ToHashSet(StringComparer.Ordinal);
-        if (classSet.Contains("flex-col"))
-        {
-            return WidgetKind.Column;
-        }
-
-        if (classSet.Contains("flex-row") || classSet.Contains("flex"))
-        {
-            return WidgetKind.Row;
         }
 
         return WidgetKind.Container;

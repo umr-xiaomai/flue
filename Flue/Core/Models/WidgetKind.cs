@@ -5,5 +5,6 @@ public enum WidgetKind
     Container,
     Row,
     Column,
-    Text
+    Text,
+    Button
 }

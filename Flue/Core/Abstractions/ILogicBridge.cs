@@ -4,5 +4,5 @@ namespace Flue.Core.Abstractions;
 
 public interface ILogicBridge
 {
-    LogicBridgeResult Parse(string scriptContent);
+    LogicBridgeResult Parse (string scriptContent);
 }

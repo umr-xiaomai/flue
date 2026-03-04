@@ -6,7 +6,7 @@ public enum CompilationEventType
     Completed
 }
 
-public sealed record CompilationEvent(
+public sealed record CompilationEvent (
     CompilationEventType EventType,
     string SourceFile,
     string TargetFile,

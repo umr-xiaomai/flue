@@ -4,5 +4,5 @@ namespace Flue.Core.Abstractions;
 
 public interface ITemplateParser
 {
-    TemplateNode Parse(string templateContent);
+    TemplateNode Parse (string templateContent);
 }

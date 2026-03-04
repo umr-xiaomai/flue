@@ -1,6 +1,6 @@
 namespace Flue.Core.Models;
 
-public sealed record TemplateNode(
+public sealed record TemplateNode (
     WidgetKind Kind,
     string TagName,
     string? TextContent,

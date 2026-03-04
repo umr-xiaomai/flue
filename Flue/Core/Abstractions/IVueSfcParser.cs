@@ -4,5 +4,5 @@ namespace Flue.Core.Abstractions;
 
 public interface IVueSfcParser
 {
-    VueSfcDocument Parse(string source);
+    VueSfcDocument Parse (string source);
 }

@@ -14,7 +14,7 @@ public sealed class DashboardState
     private DateTimeOffset compileStartAt;
     private long lastDurationMs;
 
-    public void MarkCompilationStarted(string sourceFile)
+    public void MarkCompilationStarted (string sourceFile)
     {
         lock (stateLock)
         {
@@ -24,7 +24,7 @@ public sealed class DashboardState
         }
     }
 
-    public void MarkCompilationCompleted(string sourceFile, bool success, long durationMs, string? errorMessage)
+    public void MarkCompilationCompleted (string sourceFile, bool success, long durationMs, string? errorMessage)
     {
         lock (stateLock)
         {
@@ -43,7 +43,7 @@ public sealed class DashboardState
         }
     }
 
-    public void AddLog(string message)
+    public void AddLog (string message)
     {
         lock (stateLock)
         {
@@ -51,7 +51,7 @@ public sealed class DashboardState
         }
     }
 
-    public void ClearLogs()
+    public void ClearLogs ()
     {
         lock (stateLock)
         {
@@ -59,7 +59,7 @@ public sealed class DashboardState
         }
     }
 
-    public DashboardSnapshot Snapshot()
+    public DashboardSnapshot Snapshot ()
     {
         lock (stateLock)
         {
@@ -77,7 +77,7 @@ public sealed class DashboardState
         }
     }
 
-    private void AddLogUnsafe(string message)
+    private void AddLogUnsafe (string message)
     {
         var line = $"[{DateTime.Now:HH:mm:ss}] {message}";
         logs.Enqueue(line);
@@ -88,7 +88,7 @@ public sealed class DashboardState
     }
 }
 
-public sealed record DashboardSnapshot(
+public sealed record DashboardSnapshot (
     long TotalCompilations,
     long SuccessfulCompilations,
     string CurrentFile,

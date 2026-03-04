@@ -1,5 +1,8 @@
 namespace Flue.Core.Models;
 
-public sealed record LogicBridgeResult(
+public sealed record LogicBridgeResult (
     ImmutableArray<StateField> StateFields,
-    ImmutableArray<DartMethod> Methods);
+    ImmutableArray<DartMethod> Methods,
+    bool RequiresHttpClient = false,
+    bool RequiresJsonConvert = false,
+    bool RequiresRouterSupport = false);

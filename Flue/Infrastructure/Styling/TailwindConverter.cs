@@ -74,7 +74,7 @@ public sealed class TailwindConverter : ITailwindConverter
         ["items-stretch"] = "CrossAxisAlignment.stretch"
     }.ToFrozenDictionary(StringComparer.Ordinal);
 
-    public TailwindStyle Convert(IEnumerable<string> classNames)
+    public TailwindStyle Convert (IEnumerable<string> classNames)
     {
         var widgetProperties = new HashSet<string>(StringComparer.Ordinal);
         var decorationProperties = new HashSet<string>(StringComparer.Ordinal);

@@ -4,12 +4,13 @@ using YamlDotNet.Serialization.NamingConventions;
 
 namespace Flue.Infrastructure.FileSystem;
 
-public sealed class PubspecManager(FluePaths paths)
+public sealed class PubspecManager (FluePaths paths)
 {
     private static readonly FrozenDictionary<string, string> RequiredDependencies = new Dictionary<string, string>(StringComparer.Ordinal)
     {
         ["google_fonts"] = "^6.2.1",
-        ["flue_ui"] = "^0.1.0"
+        ["flue_ui"] = "^0.1.0",
+        ["http"] = "^1.2.2"
     }.ToFrozenDictionary(StringComparer.Ordinal);
 
     private static readonly IDeserializer YamlDeserializer = new DeserializerBuilder()
@@ -21,7 +22,7 @@ public sealed class PubspecManager(FluePaths paths)
         .WithNamingConvention(CamelCaseNamingConvention.Instance)
         .Build();
 
-    public async Task EnsureDependenciesAsync(CancellationToken cancellationToken = default)
+    public async Task EnsureDependenciesAsync (CancellationToken cancellationToken = default)
     {
         Directory.CreateDirectory(paths.FlutterBridgeRoot);
 
@@ -86,7 +87,7 @@ public sealed class PubspecManager(FluePaths paths)
         await File.WriteAllTextAsync(pubspecPath, yaml, cancellationToken);
     }
 
-    private static async Task<Dictionary<object, object?>> LoadPubspecAsync(string pubspecPath, CancellationToken cancellationToken)
+    private static async Task<Dictionary<object, object?>> LoadPubspecAsync (string pubspecPath, CancellationToken cancellationToken)
     {
         if (!File.Exists(pubspecPath))
         {
@@ -103,7 +104,7 @@ public sealed class PubspecManager(FluePaths paths)
         return NormalizeToMap(parsed);
     }
 
-    private static Dictionary<object, object?> EnsureMap(Dictionary<object, object?> root, string key)
+    private static Dictionary<object, object?> EnsureMap (Dictionary<object, object?> root, string key)
     {
         if (root.TryGetValue(key, out var value))
         {
@@ -117,7 +118,7 @@ public sealed class PubspecManager(FluePaths paths)
         return created;
     }
 
-    private static Dictionary<object, object?> NormalizeToMap(object? value)
+    private static Dictionary<object, object?> NormalizeToMap (object? value)
     {
         if (value is Dictionary<object, object?> typedMap)
         {

@@ -4,5 +4,5 @@ namespace Flue.Core.Abstractions;
 
 public interface ITailwindConverter
 {
-    TailwindStyle Convert(IEnumerable<string> classNames);
+    TailwindStyle Convert (IEnumerable<string> classNames);
 }

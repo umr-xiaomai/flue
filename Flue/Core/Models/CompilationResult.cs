@@ -1,6 +1,6 @@
 namespace Flue.Core.Models;
 
-public sealed record CompilationResult(
+public sealed record CompilationResult (
     string SourceFile,
     string TargetFile,
     bool Success,

@@ -1,10 +1,11 @@
 using Flue.Core.Abstractions;
 using Flue.Core.Models;
+using Flue.Core.Utilities;
 using Flue.Infrastructure.Configuration;
 
 namespace Flue.Application;
 
-public sealed class FlueCompiler(
+public sealed class FlueCompiler (
     FluePaths paths,
     IVueSfcParser sfcParser,
     ITemplateParser templateParser,
@@ -13,7 +14,7 @@ public sealed class FlueCompiler(
 {
     public event EventHandler<CompilationEvent>? CompilationProgress;
 
-    public async Task<CompilationResult> CompileFileAsync(string sourceFilePath, CancellationToken cancellationToken = default)
+    public async Task<CompilationResult> CompileFileAsync (string sourceFilePath, CancellationToken cancellationToken = default)
     {
         var targetFilePath = paths.ToDartFilePath(sourceFilePath);
         PublishEvent(new CompilationEvent(
@@ -51,7 +52,7 @@ public sealed class FlueCompiler(
             var sfcDocument = sfcParser.Parse(source);
             var templateRoot = templateParser.Parse(sfcDocument.Template);
             var logic = logicBridge.Parse(sfcDocument.Script);
-            var className = BuildClassName(sourceFilePath);
+            var className = DartNaming.BuildWidgetClassName(sourceFilePath);
 
             var dartSource = dartCodeGenerator.Generate(
                 className,
@@ -103,7 +104,7 @@ public sealed class FlueCompiler(
         }
     }
 
-    public async Task<IReadOnlyList<CompilationResult>> CompileAllAsync(CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<CompilationResult>> CompileAllAsync (CancellationToken cancellationToken = default)
     {
         if (!Directory.Exists(paths.SourceRoot))
         {
@@ -126,28 +127,7 @@ public sealed class FlueCompiler(
         return results;
     }
 
-    private static string BuildClassName(string sourceFilePath)
-    {
-        var fileName = Path.GetFileNameWithoutExtension(sourceFilePath);
-        var parts = Regex.Split(fileName, "[^a-zA-Z0-9]+")
-            .Where(part => !string.IsNullOrWhiteSpace(part))
-            .Select(part => char.ToUpperInvariant(part[0]) + part[1..]);
-
-        var baseName = string.Concat(parts);
-        if (string.IsNullOrWhiteSpace(baseName))
-        {
-            baseName = "FlueView";
-        }
-
-        if (char.IsDigit(baseName[0]))
-        {
-            baseName = "F" + baseName;
-        }
-
-        return baseName.EndsWith("View", StringComparison.Ordinal) ? baseName : baseName + "View";
-    }
-
-    private void PublishEvent(CompilationEvent compilationEvent)
+    private void PublishEvent (CompilationEvent compilationEvent)
     {
         CompilationProgress?.Invoke(this, compilationEvent);
     }

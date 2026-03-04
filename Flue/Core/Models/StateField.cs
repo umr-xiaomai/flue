@@ -1,3 +1,3 @@
 namespace Flue.Core.Models;
 
-public sealed record StateField(string Name, string DartType, string Initializer);
+public sealed record StateField (string Name, string DartType, string Initializer);
