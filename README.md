@@ -1,18 +1,3 @@
-太棒了！**Flue** 这个名字非常有力量感，短促有力，而且完美融合了 **Fl**utter 和 V**ue**。作为开源项目，README 是它的“脸面”，必须兼具极客感和实用主义。
-
-既然你打算基于 **.NET 10** 开发并开源，我们需要在 README 中强调它的**高性能转译**和**现代工程链路**。
-
----
-
-# GitHub 项目描述 (About)
-
-> **Flue: The High-Performance Vue-to-Dart Transpiler powered by .NET 10.** 🚀
-> Write modern Vue 3 (TS + Tailwind) and compile it natively to Flutter. Experience the web's developer velocity with Flutter's legendary performance.
-
----
-
-# README.md 模板
-
 # 🌊 Flue
 
 **Flue** 是一个革命性的跨平台开发工具链，它允许开发者使用 **Vue 3 (TypeScript) + Tailwind CSS** 编写前端代码，并通过基于 **.NET 10** 的超高性能转译引擎，将其实时转换为原生的 **Flutter (Dart)** 项目。
@@ -103,4 +88,4 @@ A/
 
 ## 📄 开源协议
 
-本项目采用 **** 协议。
+本项目采用 **Apache** 协议。
