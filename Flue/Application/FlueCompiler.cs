@@ -91,7 +91,7 @@ public sealed class FlueCompiler (
                 targetFilePath,
                 Success: false,
                 DurationMs: stopwatch.ElapsedMilliseconds,
-                ErrorMessage: ex.Message);
+                ErrorMessage: $"{ex.Message}\n{ex.StackTrace}");
 
             PublishEvent(new CompilationEvent(
                 CompilationEventType.Completed,

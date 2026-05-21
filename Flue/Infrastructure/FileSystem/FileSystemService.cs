@@ -4,25 +4,32 @@ using System.Threading.Channels;
 
 namespace Flue.Infrastructure.FileSystem;
 
-public sealed class FileSystemService (
+public sealed class FileSystemService(
     FluePaths paths,
     IFlueCompiler compiler,
     PubspecManager pubspecManager,
     IFlueRouterGenerator routerGenerator) : IAsyncDisposable
 {
-    private static readonly TimeSpan DebounceWindow = TimeSpan.FromMilliseconds(120);
+    private static readonly TimeSpan BaseDebounceWindow = TimeSpan.FromMilliseconds(80);
+    private static readonly TimeSpan MaxDebounceWindow = TimeSpan.FromMilliseconds(300);
+    private static readonly TimeSpan BatchWindow = TimeSpan.FromMilliseconds(150);
+    private static readonly TimeSpan AdaptiveCooldown = TimeSpan.FromSeconds(2);
+    private const int MaxConcurrentCompilations = 8;
 
-    private readonly Channel<WatchCommand> commandChannel = Channel.CreateUnbounded<WatchCommand>(
-        new UnboundedChannelOptions
+    private readonly Channel<WatchCommand> commandChannel = Channel.CreateBounded<WatchCommand>(
+        new BoundedChannelOptions(256)
         {
             SingleReader = true,
             SingleWriter = false,
-            AllowSynchronousContinuations = false
+            AllowSynchronousContinuations = false,
+            FullMode = BoundedChannelFullMode.DropOldest
         });
 
     private readonly ConcurrentDictionary<string, DateTimeOffset> debounceBook =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> knownSourceDirectories =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> pendingCompilations =
         new(StringComparer.OrdinalIgnoreCase);
 
     private FileSystemWatcher? watcher;
@@ -30,10 +37,13 @@ public sealed class FileSystemService (
     private CancellationTokenSource? runtimeCts;
     private Task? workerTask;
     private int started;
+    private DateTimeOffset lastActivityAt = DateTimeOffset.UtcNow;
+    private long highActivityCount;
+    private bool requiresRouterSync;
 
     public event EventHandler<string>? StatusChanged;
 
-    public async Task StartAsync (CancellationToken cancellationToken = default)
+    public async Task StartAsync(CancellationToken cancellationToken = default)
     {
         if (Interlocked.Exchange(ref started, 1) == 1)
         {
@@ -49,17 +59,17 @@ public sealed class FileSystemService (
         StartWatcher();
         SyncExistingDirectories();
         Enqueue(new FullRebuildCommand());
-        PublishStatus("File watcher started.");
+        PublishStatus("File watcher started with optimized hot reload.");
     }
 
-    public Task TriggerFullRebuildAsync (CancellationToken cancellationToken = default)
+    public Task TriggerFullRebuildAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         Enqueue(new FullRebuildCommand());
         return Task.CompletedTask;
     }
 
-    public async Task StopAsync ()
+    public async Task StopAsync()
     {
         if (Interlocked.Exchange(ref started, 0) == 0)
         {
@@ -86,7 +96,6 @@ public sealed class FileSystemService (
             }
             catch (OperationCanceledException)
             {
-                // Ignore expected cancellation when shutting down.
             }
         }
 
@@ -96,12 +105,12 @@ public sealed class FileSystemService (
         PublishStatus("File watcher stopped.");
     }
 
-    public async ValueTask DisposeAsync ()
+    public async ValueTask DisposeAsync()
     {
         await StopAsync();
     }
 
-    private void StartWatcher ()
+    private void StartWatcher()
     {
         watcher = new FileSystemWatcher(paths.SourceRoot)
         {
@@ -134,7 +143,7 @@ public sealed class FileSystemService (
         rootRouterWatcher.EnableRaisingEvents = true;
     }
 
-    private void SyncExistingDirectories ()
+    private void SyncExistingDirectories()
     {
         Directory.CreateDirectory(paths.SourceRoot);
         Directory.CreateDirectory(paths.DartLibRoot);
@@ -149,65 +158,204 @@ public sealed class FileSystemService (
         }
     }
 
-    private async Task ProcessQueueAsync (CancellationToken cancellationToken)
+    private async Task ProcessQueueAsync(CancellationToken cancellationToken)
     {
+        var batch = new List<WatchCommand>();
+
         await foreach (var command in commandChannel.Reader.ReadAllAsync(cancellationToken))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            try
+
+            if (command is CompileFileCommand or SyncRouterCommand)
             {
-                switch (command)
+                batch.Add(command);
+                // Drain additional commands within batch window
+                await DrainBatchAsync(batch, cancellationToken);
+            }
+            else
+            {
+                if (batch.Count > 0)
                 {
-                    case CompileFileCommand compileFileCommand:
-                        await HandleCompileFileAsync(compileFileCommand.SourceFilePath, cancellationToken);
-                        break;
-                    case DeleteFileCommand deleteFileCommand:
-                        HandleDeleteFile(deleteFileCommand.SourceFilePath);
-                        break;
-                    case DeleteDirectoryCommand deleteDirectoryCommand:
-                        HandleDeleteDirectory(deleteDirectoryCommand.SourceDirectoryPath);
-                        break;
-                    case EnsureDirectoryCommand ensureDirectoryCommand:
-                        HandleEnsureDirectory(ensureDirectoryCommand.SourceDirectoryPath);
-                        break;
-                    case RenamePathCommand renamePathCommand:
-                        await HandleRenameAsync(renamePathCommand, cancellationToken);
-                        break;
-                    case SyncRouterCommand:
-                        await routerGenerator.SyncAsync(cancellationToken);
-                        break;
-                    case FullRebuildCommand:
-                        await HandleFullRebuildAsync(cancellationToken);
-                        break;
+                    await ProcessBatchAsync(batch, cancellationToken);
+                    batch.Clear();
+                }
+                await ProcessSingleCommandAsync(command, cancellationToken);
+            }
+        }
+
+        if (batch.Count > 0)
+        {
+            await ProcessBatchAsync(batch, cancellationToken);
+        }
+    }
+
+    private async Task DrainBatchAsync(List<WatchCommand> batch, CancellationToken cancellationToken)
+    {
+        var drainEnd = DateTimeOffset.UtcNow + BatchWindow;
+        while (DateTimeOffset.UtcNow < drainEnd)
+        {
+            if (commandChannel.Reader.TryRead(out var next))
+            {
+                if (next is CompileFileCommand or SyncRouterCommand)
+                {
+                    batch.Add(next);
+                }
+                else
+                {
+                    if (batch.Count > 0)
+                    {
+                        await ProcessBatchAsync(batch, cancellationToken);
+                        batch.Clear();
+                    }
+                    await ProcessSingleCommandAsync(next, cancellationToken);
+                    return;
                 }
             }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            else
             {
-                break;
-            }
-            catch (Exception ex)
-            {
-                PublishStatus($"Queue error: {ex.Message}");
+                await Task.Delay(10, cancellationToken);
             }
         }
     }
 
-    private async Task HandleCompileFileAsync (string sourceFilePath, CancellationToken cancellationToken)
+    private async Task ProcessBatchAsync(List<WatchCommand> batch, CancellationToken cancellationToken)
     {
-        if (!File.Exists(sourceFilePath))
+        bool needsRouterSync = false;
+        var filesToCompile = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var command in batch)
+        {
+            switch (command)
+            {
+                case CompileFileCommand cfc:
+                    if (File.Exists(cfc.SourceFilePath))
+                    {
+                        filesToCompile.Add(cfc.SourceFilePath);
+                    }
+                    break;
+                case SyncRouterCommand:
+                    needsRouterSync = true;
+                    break;
+            }
+        }
+
+        if (filesToCompile.Count == 0 && !needsRouterSync)
         {
             return;
         }
 
-        await WaitForReadAccessAsync(sourceFilePath, cancellationToken);
-        var result = await compiler.CompileFileAsync(sourceFilePath, cancellationToken);
-        if (!result.Success)
+        if (filesToCompile.Count > 0)
         {
-            PublishStatus($"Compile failed: {paths.ToRelativeSourcePath(sourceFilePath)} - {result.ErrorMessage}");
+            PublishStatus($"Compiling {filesToCompile.Count} file(s)...");
+
+            await Parallel.ForEachAsync(
+                filesToCompile,
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = MaxConcurrentCompilations,
+                    CancellationToken = cancellationToken
+                },
+                async (sourceFilePath, ct) =>
+                {
+                    try
+                    {
+                        await WaitForReadAccessAsync(sourceFilePath, ct);
+                        var result = await compiler.CompileFileAsync(sourceFilePath, ct);
+                        if (!result.Success)
+                        {
+                            PublishStatus($"Compile failed: {paths.ToRelativeSourcePath(sourceFilePath)} - {result.ErrorMessage}");
+                        }
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        PublishStatus($"Compile error: {paths.ToRelativeSourcePath(sourceFilePath)} - {ex.Message}");
+                    }
+                });
+
+            pendingCompilations.Clear();
+        }
+
+        if (needsRouterSync || requiresRouterSync)
+        {
+            requiresRouterSync = false;
+            try
+            {
+                await routerGenerator.SyncAsync(cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                PublishStatus($"Router sync error: {ex.Message}");
+            }
+        }
+
+        RecordActivity();
+    }
+
+    private async Task ProcessSingleCommandAsync(WatchCommand command, CancellationToken cancellationToken)
+    {
+        try
+        {
+            switch (command)
+            {
+                case FullRebuildCommand:
+                    await HandleFullRebuildAsync(cancellationToken);
+                    break;
+                case DeleteFileCommand deleteFileCommand:
+                    HandleDeleteFile(deleteFileCommand.SourceFilePath);
+                    break;
+                case DeleteDirectoryCommand deleteDirectoryCommand:
+                    HandleDeleteDirectory(deleteDirectoryCommand.SourceDirectoryPath);
+                    break;
+                case EnsureDirectoryCommand ensureDirectoryCommand:
+                    HandleEnsureDirectory(ensureDirectoryCommand.SourceDirectoryPath);
+                    break;
+                case RenamePathCommand renamePathCommand:
+                    await HandleRenameAsync(renamePathCommand, cancellationToken);
+                    break;
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            PublishStatus($"Queue error: {ex.Message}");
+        }
+
+        RecordActivity();
+    }
+
+    private void RecordActivity()
+    {
+        lastActivityAt = DateTimeOffset.UtcNow;
+        Interlocked.Increment(ref highActivityCount);
+    }
+
+    private TimeSpan CurrentDebounceWindow
+    {
+        get
+        {
+            var elapsed = DateTimeOffset.UtcNow - lastActivityAt;
+            if (elapsed < AdaptiveCooldown && Interlocked.Read(ref highActivityCount) > 10)
+            {
+                return BaseDebounceWindow;
+            }
+
+            Interlocked.Exchange(ref highActivityCount, 0);
+            return MaxDebounceWindow;
         }
     }
 
-    private void HandleDeleteFile (string sourceFilePath)
+    private async Task HandleFullRebuildAsync(CancellationToken cancellationToken)
+    {
+        PublishStatus("Full rebuild started.");
+        SyncExistingDirectories();
+
+        var results = await compiler.CompileAllAsync(cancellationToken);
+        await routerGenerator.SyncAsync(cancellationToken);
+        var successCount = results.Count(result => result.Success);
+        PublishStatus($"Full rebuild completed: {successCount}/{results.Count} succeeded.");
+        RecordActivity();
+    }
+
+    private void HandleDeleteFile(string sourceFilePath)
     {
         if (!TryMapDartFile(sourceFilePath, out var targetDartFile))
         {
@@ -223,7 +371,7 @@ public sealed class FileSystemService (
         PublishStatus($"Removed: {Path.GetRelativePath(paths.DartLibRoot, targetDartFile)}");
     }
 
-    private void HandleEnsureDirectory (string sourceDirectoryPath)
+    private void HandleEnsureDirectory(string sourceDirectoryPath)
     {
         RegisterKnownDirectory(sourceDirectoryPath);
 
@@ -235,7 +383,7 @@ public sealed class FileSystemService (
         Directory.CreateDirectory(targetDartDirectory);
     }
 
-    private void HandleDeleteDirectory (string sourceDirectoryPath)
+    private void HandleDeleteDirectory(string sourceDirectoryPath)
     {
         UnregisterKnownDirectoryTree(sourceDirectoryPath);
 
@@ -253,7 +401,7 @@ public sealed class FileSystemService (
         PublishStatus($"Removed folder: {Path.GetRelativePath(paths.DartLibRoot, targetDartDirectory)}");
     }
 
-    private async Task HandleRenameAsync (RenamePathCommand renamePathCommand, CancellationToken cancellationToken)
+    private async Task HandleRenameAsync(RenamePathCommand renamePathCommand, CancellationToken cancellationToken)
     {
         if (renamePathCommand.IsDirectory)
         {
@@ -264,10 +412,10 @@ public sealed class FileSystemService (
             await HandleFileRenameAsync(renamePathCommand.OldPath, renamePathCommand.NewPath, cancellationToken);
         }
 
-        await routerGenerator.SyncAsync(cancellationToken);
+        requiresRouterSync = true;
     }
 
-    private async Task HandleFileRenameAsync (string oldSourcePath, string newSourcePath, CancellationToken cancellationToken)
+    private async Task HandleFileRenameAsync(string oldSourcePath, string newSourcePath, CancellationToken cancellationToken)
     {
         var wasVueFile = IsVueFile(oldSourcePath);
         var isVueFile = IsVueFile(newSourcePath);
@@ -280,7 +428,7 @@ public sealed class FileSystemService (
                 {
                     if (File.Exists(newSourcePath))
                     {
-                        await HandleCompileFileAsync(newSourcePath, cancellationToken);
+                        Enqueue(new CompileFileCommand(newSourcePath));
                     }
 
                     return;
@@ -309,11 +457,11 @@ public sealed class FileSystemService (
 
         if (isVueFile && File.Exists(newSourcePath))
         {
-            await HandleCompileFileAsync(newSourcePath, cancellationToken);
+            Enqueue(new CompileFileCommand(newSourcePath));
         }
     }
 
-    private async Task HandleDirectoryRenameAsync (string oldDirectoryPath, string newDirectoryPath, CancellationToken cancellationToken)
+    private async Task HandleDirectoryRenameAsync(string oldDirectoryPath, string newDirectoryPath, CancellationToken cancellationToken)
     {
         UpdateKnownDirectoriesOnRename(oldDirectoryPath, newDirectoryPath);
 
@@ -356,11 +504,11 @@ public sealed class FileSystemService (
         foreach (var vueFile in Directory.EnumerateFiles(newDirectoryPath, "*.vue", SearchOption.AllDirectories))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            await HandleCompileFileAsync(vueFile, cancellationToken);
+            Enqueue(new CompileFileCommand(vueFile));
         }
     }
 
-    private static void MoveDirectoryContents (string sourceDirectory, string targetDirectory)
+    private static void MoveDirectoryContents(string sourceDirectory, string targetDirectory)
     {
         Directory.CreateDirectory(targetDirectory);
 
@@ -389,18 +537,7 @@ public sealed class FileSystemService (
         }
     }
 
-    private async Task HandleFullRebuildAsync (CancellationToken cancellationToken)
-    {
-        PublishStatus("Full rebuild started.");
-        SyncExistingDirectories();
-
-        var results = await compiler.CompileAllAsync(cancellationToken);
-        await routerGenerator.SyncAsync(cancellationToken);
-        var successCount = results.Count(result => result.Success);
-        PublishStatus($"Full rebuild completed: {successCount}/{results.Count} succeeded.");
-    }
-
-    private void OnCreatedOrChanged (object sender, FileSystemEventArgs args)
+    private void OnCreatedOrChanged(object sender, FileSystemEventArgs args)
     {
         if (runtimeCts?.IsCancellationRequested is true)
         {
@@ -409,6 +546,7 @@ public sealed class FileSystemService (
 
         if (routerGenerator.IsRouterFile(args.FullPath))
         {
+            requiresRouterSync = true;
             Enqueue(new SyncRouterCommand());
             return;
         }
@@ -420,15 +558,21 @@ public sealed class FileSystemService (
             return;
         }
 
-        if (!IsVueFile(args.FullPath) || ShouldDebounce(args.FullPath))
+        if (!IsVueFile(args.FullPath))
         {
             return;
         }
 
+        if (ShouldDebounce(args.FullPath))
+        {
+            return;
+        }
+
+        pendingCompilations[args.FullPath] = 0;
         Enqueue(new CompileFileCommand(args.FullPath));
     }
 
-    private void OnDeleted (object sender, FileSystemEventArgs args)
+    private void OnDeleted(object sender, FileSystemEventArgs args)
     {
         if (runtimeCts?.IsCancellationRequested is true)
         {
@@ -437,6 +581,7 @@ public sealed class FileSystemService (
 
         if (routerGenerator.IsRouterFile(args.FullPath))
         {
+            requiresRouterSync = true;
             Enqueue(new SyncRouterCommand());
             return;
         }
@@ -452,10 +597,11 @@ public sealed class FileSystemService (
             return;
         }
 
+        pendingCompilations.TryRemove(args.FullPath, out _);
         Enqueue(new DeleteFileCommand(args.FullPath));
     }
 
-    private void OnRenamed (object sender, RenamedEventArgs args)
+    private void OnRenamed(object sender, RenamedEventArgs args)
     {
         if (runtimeCts?.IsCancellationRequested is true)
         {
@@ -464,6 +610,7 @@ public sealed class FileSystemService (
 
         if (routerGenerator.IsRouterFile(args.OldFullPath) || routerGenerator.IsRouterFile(args.FullPath))
         {
+            requiresRouterSync = true;
             Enqueue(new SyncRouterCommand());
             if (!IsVueFile(args.OldFullPath) && !IsVueFile(args.FullPath))
             {
@@ -477,46 +624,51 @@ public sealed class FileSystemService (
             UpdateKnownDirectoriesOnRename(args.OldFullPath, args.FullPath);
         }
 
+        pendingCompilations.TryRemove(args.OldFullPath, out _);
         Enqueue(new RenamePathCommand(
             args.OldFullPath,
             args.FullPath,
             isDirectoryRename));
     }
 
-    private void OnWatcherError (object sender, ErrorEventArgs args)
+    private void OnWatcherError(object sender, ErrorEventArgs args)
     {
         PublishStatus($"Watcher error: {args.GetException().Message}");
     }
 
-    private void OnRootRouterChanged (object sender, FileSystemEventArgs args)
+    private void OnRootRouterChanged(object sender, FileSystemEventArgs args)
     {
         if (runtimeCts?.IsCancellationRequested is true)
         {
             return;
         }
 
+        requiresRouterSync = true;
         Enqueue(new SyncRouterCommand());
     }
 
-    private void OnRootRouterRenamed (object sender, RenamedEventArgs args)
+    private void OnRootRouterRenamed(object sender, RenamedEventArgs args)
     {
         if (runtimeCts?.IsCancellationRequested is true)
         {
             return;
         }
 
+        requiresRouterSync = true;
         Enqueue(new SyncRouterCommand());
     }
 
-    private void Enqueue (WatchCommand command)
+    private void Enqueue(WatchCommand command)
     {
         commandChannel.Writer.TryWrite(command);
     }
 
-    private bool ShouldDebounce (string sourceFilePath)
+    private bool ShouldDebounce(string sourceFilePath)
     {
         var now = DateTimeOffset.UtcNow;
-        if (debounceBook.TryGetValue(sourceFilePath, out var previous) && now - previous < DebounceWindow)
+        var window = CurrentDebounceWindow;
+
+        if (debounceBook.TryGetValue(sourceFilePath, out var previous) && now - previous < window)
         {
             return true;
         }
@@ -525,12 +677,12 @@ public sealed class FileSystemService (
         return false;
     }
 
-    private static bool IsVueFile (string fullPath)
+    private static bool IsVueFile(string fullPath)
     {
         return fullPath.EndsWith(".vue", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool IsDirectoryRename (RenamedEventArgs args)
+    private static bool IsDirectoryRename(RenamedEventArgs args)
     {
         if (Directory.Exists(args.FullPath) || Directory.Exists(args.OldFullPath))
         {
@@ -545,7 +697,7 @@ public sealed class FileSystemService (
         return !Path.HasExtension(args.FullPath) && !Path.HasExtension(args.OldFullPath);
     }
 
-    private bool TryMapDartFile (string sourceFilePath, out string targetDartPath)
+    private bool TryMapDartFile(string sourceFilePath, out string targetDartPath)
     {
         targetDartPath = string.Empty;
         if (!IsVueFile(sourceFilePath))
@@ -563,7 +715,7 @@ public sealed class FileSystemService (
         return true;
     }
 
-    private bool TryMapDartDirectory (string sourceDirectoryPath, out string targetDartDirectory)
+    private bool TryMapDartDirectory(string sourceDirectoryPath, out string targetDartDirectory)
     {
         targetDartDirectory = string.Empty;
 
@@ -577,13 +729,13 @@ public sealed class FileSystemService (
         return true;
     }
 
-    private bool IsKnownSourceDirectory (string sourcePath)
+    private bool IsKnownSourceDirectory(string sourcePath)
     {
         var normalized = NormalizePath(sourcePath);
         return knownSourceDirectories.ContainsKey(normalized);
     }
 
-    private void RegisterKnownDirectory (string sourceDirectoryPath)
+    private void RegisterKnownDirectory(string sourceDirectoryPath)
     {
         var normalized = NormalizePath(sourceDirectoryPath);
         if (normalized.Length == 0)
@@ -599,7 +751,7 @@ public sealed class FileSystemService (
         knownSourceDirectories[normalized] = 0;
     }
 
-    private void UnregisterKnownDirectoryTree (string sourceDirectoryPath)
+    private void UnregisterKnownDirectoryTree(string sourceDirectoryPath)
     {
         var normalized = NormalizePath(sourceDirectoryPath);
         if (normalized.Length == 0)
@@ -618,7 +770,7 @@ public sealed class FileSystemService (
         }
     }
 
-    private void UpdateKnownDirectoriesOnRename (string oldDirectoryPath, string newDirectoryPath)
+    private void UpdateKnownDirectoriesOnRename(string oldDirectoryPath, string newDirectoryPath)
     {
         var normalizedOld = NormalizePath(oldDirectoryPath);
         var normalizedNew = NormalizePath(newDirectoryPath);
@@ -648,7 +800,7 @@ public sealed class FileSystemService (
         }
     }
 
-    private static bool IsSameOrChildPath (string candidatePath, string parentPath)
+    private static bool IsSameOrChildPath(string candidatePath, string parentPath)
     {
         if (string.Equals(candidatePath, parentPath, StringComparison.OrdinalIgnoreCase))
         {
@@ -659,7 +811,7 @@ public sealed class FileSystemService (
                candidatePath.StartsWith(parentPath + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string NormalizePath (string path)
+    private static string NormalizePath(string path)
     {
         if (string.IsNullOrWhiteSpace(path))
         {
@@ -670,14 +822,14 @@ public sealed class FileSystemService (
             .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
     }
 
-    private void PublishStatus (string message)
+    private void PublishStatus(string message)
     {
         StatusChanged?.Invoke(this, message);
     }
 
-    private static async Task WaitForReadAccessAsync (string filePath, CancellationToken cancellationToken)
+    private static async Task WaitForReadAccessAsync(string filePath, CancellationToken cancellationToken)
     {
-        for (var attempt = 0; attempt < 8; attempt++)
+        for (var attempt = 0; attempt < 5; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -691,24 +843,23 @@ public sealed class FileSystemService (
             }
             catch (IOException)
             {
-                // File is still being written, wait and retry.
             }
 
-            await Task.Delay(50, cancellationToken);
+            await Task.Delay(30, cancellationToken);
         }
     }
 
     private abstract record WatchCommand;
 
-    private sealed record CompileFileCommand (string SourceFilePath) : WatchCommand;
+    private sealed record CompileFileCommand(string SourceFilePath) : WatchCommand;
 
-    private sealed record DeleteFileCommand (string SourceFilePath) : WatchCommand;
+    private sealed record DeleteFileCommand(string SourceFilePath) : WatchCommand;
 
-    private sealed record DeleteDirectoryCommand (string SourceDirectoryPath) : WatchCommand;
+    private sealed record DeleteDirectoryCommand(string SourceDirectoryPath) : WatchCommand;
 
-    private sealed record EnsureDirectoryCommand (string SourceDirectoryPath) : WatchCommand;
+    private sealed record EnsureDirectoryCommand(string SourceDirectoryPath) : WatchCommand;
 
-    private sealed record RenamePathCommand (string OldPath, string NewPath, bool IsDirectory) : WatchCommand;
+    private sealed record RenamePathCommand(string OldPath, string NewPath, bool IsDirectory) : WatchCommand;
 
     private sealed record SyncRouterCommand : WatchCommand;
 

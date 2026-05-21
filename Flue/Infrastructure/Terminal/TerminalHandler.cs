@@ -6,7 +6,7 @@ using Spectre.Console;
 
 namespace Flue.Infrastructure.Terminal;
 
-public sealed class TerminalHandler (
+public sealed class TerminalHandler(
     FileSystemService fileSystemService,
     IFlueCompiler compiler,
     FluePaths paths)
@@ -14,7 +14,7 @@ public sealed class TerminalHandler (
     private readonly DashboardState dashboard = new();
     private readonly Lock outputLock = new();
 
-    public async Task RunAsync (CancellationToken cancellationToken = default)
+    public async Task RunAsync(CancellationToken cancellationToken = default)
     {
         using var runtimeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
@@ -40,7 +40,7 @@ public sealed class TerminalHandler (
         }
     }
 
-    private void OnCompilationProgress (object? sender, CompilationEvent compilationEvent)
+    private void OnCompilationProgress(object? sender, CompilationEvent compilationEvent)
     {
         var relativeSource = ToRelative(compilationEvent.SourceFile);
         if (compilationEvent.EventType is CompilationEventType.Started)
@@ -70,7 +70,7 @@ public sealed class TerminalHandler (
         WriteError($"Compile failed {relativeSource} | elapsed={compilationEvent.DurationMs} ms | {FormatRate(completedSnapshot)} | {errorDetail}");
     }
 
-    private void OnStatusChanged (object? sender, string message)
+    private void OnStatusChanged(object? sender, string message)
     {
         dashboard.AddLog(message);
 
@@ -103,7 +103,7 @@ public sealed class TerminalHandler (
         WriteInfo(message);
     }
 
-    private async Task KeyLoopAsync (CancellationTokenSource runtimeCts)
+    private async Task KeyLoopAsync(CancellationTokenSource runtimeCts)
     {
         var token = runtimeCts.Token;
 
@@ -153,7 +153,7 @@ public sealed class TerminalHandler (
         }
     }
 
-    private async Task RenderRealtimeStatsAsync (CancellationToken cancellationToken)
+    private async Task RenderRealtimeStatsAsync(CancellationToken cancellationToken)
     {
         try
         {
@@ -174,7 +174,7 @@ public sealed class TerminalHandler (
         }
     }
 
-    private static bool IsConsoleKeyAvailable ()
+    private static bool IsConsoleKeyAvailable()
     {
         try
         {
@@ -186,7 +186,7 @@ public sealed class TerminalHandler (
         }
     }
 
-    private static string FormatRate (DashboardSnapshot snapshot)
+    private static string FormatRate(DashboardSnapshot snapshot)
     {
         var rate = snapshot.TotalCompilations == 0
             ? 100.0
@@ -194,37 +194,37 @@ public sealed class TerminalHandler (
         return $"success={rate:F2}% ({snapshot.SuccessfulCompilations}/{snapshot.TotalCompilations})";
     }
 
-    private void WriteInfo (string message)
+    private void WriteInfo(string message)
     {
         WriteLine("deepskyblue2", "INFO", message);
     }
 
-    private void WriteSuccess (string message)
+    private void WriteSuccess(string message)
     {
         WriteLine("springgreen2", "OK", message);
     }
 
-    private void WriteWarning (string message)
+    private void WriteWarning(string message)
     {
         WriteLine("gold1", "WARN", message);
     }
 
-    private void WriteError (string message)
+    private void WriteError(string message)
     {
         WriteLine("red1", "ERR", message);
     }
 
-    private void WriteAction (string message)
+    private void WriteAction(string message)
     {
         WriteLine("mediumpurple3", "ACT", message);
     }
 
-    private void WriteTrace (string message)
+    private void WriteTrace(string message)
     {
         WriteLine("grey62", "TRACE", message);
     }
 
-    private void WriteLine (string color, string level, string message)
+    private void WriteLine(string color, string level, string message)
     {
         var escapedMessage = Markup.Escape(message);
         lock (outputLock)
@@ -233,7 +233,7 @@ public sealed class TerminalHandler (
         }
     }
 
-    private string ToRelative (string sourceFile)
+    private string ToRelative(string sourceFile)
     {
         if (string.IsNullOrWhiteSpace(sourceFile))
         {

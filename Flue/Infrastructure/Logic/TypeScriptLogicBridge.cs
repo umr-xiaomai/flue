@@ -54,6 +54,48 @@ public sealed partial class TypeScriptLogicBridge : ILogicBridge
     [GeneratedRegex("`(?<content>(?:\\\\.|[^`])*)`", RegexOptions.Compiled)]
     private static partial Regex TemplateRegex ();
 
+    [GeneratedRegex("computed\\(\\s*\\(\\s*\\)\\s*=>\\s*(?<body>[\\s\\S]+?)\\s*\\)", RegexOptions.Compiled)]
+    private static partial Regex ComputedRegex ();
+
+    [GeneratedRegex("onMounted\\(\\s*\\(\\s*\\)\\s*=>\\s*\\{(?<body>[\\s\\S]*?)\\}\\s*\\)", RegexOptions.Compiled)]
+    private static partial Regex OnMountedRegex ();
+
+    [GeneratedRegex("onUnmounted\\(\\s*\\(\\s*\\)\\s*=>\\s*\\{(?<body>[\\s\\S]*?)\\}\\s*\\)", RegexOptions.Compiled)]
+    private static partial Regex OnUnmountedRegex ();
+
+    [GeneratedRegex("watch\\(\\s*(?<target>[^,]+)\\s*,\\s*\\((?<params>[^)]*)\\)\\s*=>\\s*\\{(?<body>[\\s\\S]*?)\\}\\s*\\)", RegexOptions.Compiled)]
+    private static partial Regex WatchRegex ();
+
+    [GeneratedRegex("setTimeout\\(\\s*\\(\\s*\\)\\s*=>\\s*\\{(?<body>[\\s\\S]*?)\\}\\s*,\\s*(?<delay>[^)]+)\\s*\\)", RegexOptions.Compiled)]
+    private static partial Regex SetTimeoutRegex ();
+
+    [GeneratedRegex("setInterval\\(\\s*\\(\\s*\\)\\s*=>\\s*\\{(?<body>[\\s\\S]*?)\\}\\s*,\\s*(?<delay>[^)]+)\\s*\\)", RegexOptions.Compiled)]
+    private static partial Regex SetIntervalRegex ();
+
+    [GeneratedRegex("(?<name>[A-Za-z_]\\w*)\\.(?<method>map|filter|find|forEach|reduce|some|every|includes|join|split|slice|splice|sort|reverse|indexOf|flatMap)\\(", RegexOptions.Compiled)]
+    private static partial Regex ArrayMethodRegex ();
+
+    [GeneratedRegex("localStorage\\.(?<method>getItem|setItem|removeItem|clear)\\((?<args>[\\s\\S]*)\\)", RegexOptions.Compiled)]
+    private static partial Regex LocalStorageRegex ();
+
+    [GeneratedRegex("new\\s+Date\\((?<args>[^)]*)\\)", RegexOptions.Compiled)]
+    private static partial Regex NewDateRegex ();
+
+    [GeneratedRegex("Math\\.(?<method>abs|ceil|floor|round|max|min|pow|sqrt|random)\\(", RegexOptions.Compiled)]
+    private static partial Regex MathMethodRegex ();
+
+    [GeneratedRegex("parseInt\\((?<value>[^)]+)\\)", RegexOptions.Compiled)]
+    private static partial Regex ParseIntRegex ();
+
+    [GeneratedRegex("parseFloat\\((?<value>[^)]+)\\)", RegexOptions.Compiled)]
+    private static partial Regex ParseFloatRegex ();
+
+    [GeneratedRegex("^import\\s+", RegexOptions.Compiled)]
+    private static partial Regex ImportLineRegex ();
+
+    public bool HasLifecycleHooks { get; private set; }
+    public bool HasComputed { get; private set; }
+
     public LogicBridgeResult Parse (string scriptContent)
     {
         if (string.IsNullOrWhiteSpace(scriptContent))
@@ -61,10 +103,30 @@ public sealed partial class TypeScriptLogicBridge : ILogicBridge
             return new LogicBridgeResult(ImmutableArray<StateField>.Empty, ImmutableArray<DartMethod>.Empty);
         }
 
+        HasLifecycleHooks = false;
+        HasComputed = false;
+
         var stateFields = ParseStateFields(scriptContent);
         var stateNames = stateFields.Select(field => field.Name).ToHashSet(StringComparer.Ordinal);
+
+        var lifecycleMethods = ParseLifecycleHooks(scriptContent);
+        var computedProperties = ParseComputedProperties(scriptContent);
+
         var methods = ParseMethods(scriptContent, stateNames, out var requiresHttp, out var requiresJson, out var requiresRouter);
-        return new LogicBridgeResult(stateFields, methods, requiresHttp, requiresJson, requiresRouter);
+
+        var allMethods = methods;
+        if (lifecycleMethods.Length > 0)
+        {
+            allMethods = [.. methods, .. lifecycleMethods];
+            HasLifecycleHooks = true;
+        }
+
+        return new LogicBridgeResult(
+            stateFields,
+            allMethods,
+            requiresHttp,
+            requiresJson,
+            requiresRouter && allMethods.Any(m => m.Body.Contains("Navigator.", StringComparison.Ordinal)));
     }
 
     private static ImmutableArray<StateField> ParseStateFields (string scriptContent)
@@ -182,6 +244,84 @@ public sealed partial class TypeScriptLogicBridge : ILogicBridge
         return string.Join(", ", parameters);
     }
 
+    private ImmutableArray<DartMethod> ParseLifecycleHooks (string scriptContent)
+    {
+        var methods = ImmutableArray.CreateBuilder<DartMethod>();
+
+        var mountedMatch = OnMountedRegex().Match(scriptContent);
+        if (mountedMatch.Success)
+        {
+            var body = ConvertLifecycleBody(mountedMatch.Groups["body"].Value);
+            body = body.Replace("onMounted", "initState", StringComparison.Ordinal);
+            methods.Add(new DartMethod("initState", string.Empty, body, false, "void"));
+        }
+
+        var unmountedMatch = OnUnmountedRegex().Match(scriptContent);
+        if (unmountedMatch.Success)
+        {
+            var body = ConvertLifecycleBody(unmountedMatch.Groups["body"].Value);
+            methods.Add(new DartMethod("dispose", string.Empty, body, false, "void"));
+        }
+
+        foreach (Match match in WatchRegex().Matches(scriptContent))
+        {
+            var target = match.Groups["target"].Value.Trim().Replace(".value", string.Empty, StringComparison.Ordinal);
+            var body = ConvertLifecycleBody(match.Groups["body"].Value);
+            var watchBody = $"// Watch triggered by {target} changes{Environment.NewLine}{body}";
+            methods.Add(new DartMethod($"on{char.ToUpperInvariant(target[0])}{target[1..]}Changed", string.Empty, watchBody, false, "void"));
+        }
+
+        return methods.ToImmutable();
+    }
+
+    private static string ConvertLifecycleBody (string tsBody)
+    {
+        var body = tsBody.Trim();
+        if (body.StartsWith('{') && body.EndsWith('}'))
+            body = body[1..^1].Trim();
+
+        if (!body.Contains('\n') && !body.Contains(';'))
+            return ConvertStatementSimple(body) + ";";
+
+        var lines = MergeLines(body);
+        var output = new List<string>(lines.Count);
+        foreach (var statement in lines)
+        {
+            var converted = ConvertStatementSimple(statement);
+            if (converted.Length > 0)
+                output.Add(converted);
+        }
+
+        return string.Join(Environment.NewLine, output);
+    }
+
+    private ImmutableArray<DartMethod> ParseComputedProperties (string scriptContent)
+    {
+        var methods = ImmutableArray.CreateBuilder<DartMethod>();
+
+        foreach (Match match in ComputedRegex().Matches(scriptContent))
+        {
+            var body = match.Groups["body"].Value.Trim();
+            if (body.StartsWith('{') && body.EndsWith('}'))
+                body = body[1..^1].Trim();
+
+            if (body.Contains("return ", StringComparison.Ordinal))
+            {
+                var returnExpr = body["return ".Length..].Trim().TrimEnd(';');
+                var name = $"computed{CryptoRandomSuffix()}";
+                HasComputed = true;
+                methods.Add(new DartMethod(name, string.Empty, $"return {returnExpr};", false, "dynamic"));
+            }
+        }
+
+        return methods.ToImmutable();
+    }
+
+    private static string CryptoRandomSuffix ()
+    {
+        return Random.Shared.Next(10000, 99999).ToString();
+    }
+
     private static string ConvertMethodBody (string tsBody, HashSet<string> stateNames, ref bool requiresHttp, ref bool requiresJson, ref bool requiresRouter)
     {
         var body = tsBody.Trim();
@@ -247,6 +387,21 @@ public sealed partial class TypeScriptLogicBridge : ILogicBridge
         if (TryConvertVariableDeclaration(line, stateNames, ref requiresJson, out var declarationLine))
         {
             return declarationLine;
+        }
+
+        if (TryConvertSetTimeout(line, ref requiresJson, out var timeoutLine))
+        {
+            return timeoutLine;
+        }
+
+        if (TryConvertLocalStorage(line, stateNames, ref requiresJson, out var storageLine))
+        {
+            return storageLine;
+        }
+
+        if (TryConvertArrayMethod(line, stateNames, ref requiresJson, out var arrayLine))
+        {
+            return arrayLine;
         }
 
         var expression = ConvertExpression(line, stateNames, ref requiresJson);
@@ -531,6 +686,118 @@ public sealed partial class TypeScriptLogicBridge : ILogicBridge
         return $"{ResolveDartType(type, initializer)} {name} = {initializer}";
     }
 
+    private static bool TryConvertSetTimeout (string line, ref bool requiresJson, out string converted)
+    {
+        var match = SetTimeoutRegex().Match(line);
+        if (!match.Success)
+        {
+            match = SetIntervalRegex().Match(line);
+            if (!match.Success)
+            {
+                converted = string.Empty;
+                return false;
+            }
+        }
+
+        var body = match.Groups["body"].Value.Trim();
+        var delay = match.Groups["delay"].Value.Trim();
+
+        body = body.Replace(".value", string.Empty, StringComparison.Ordinal);
+        body = body.Replace("===", "==", StringComparison.Ordinal)
+                   .Replace("!==", "!=", StringComparison.Ordinal);
+
+        converted = line.Contains("setInterval", StringComparison.Ordinal)
+            ? $"Timer.periodic(Duration(milliseconds: {delay}), (_) {{ {body}; }});"
+            : $"Timer(Duration(milliseconds: {delay}), () {{ {body}; }});";
+
+        return true;
+    }
+
+    private static bool TryConvertLocalStorage (string line, HashSet<string> stateNames, ref bool requiresJson, out string converted)
+    {
+        var match = LocalStorageRegex().Match(line);
+        if (!match.Success)
+        {
+            converted = string.Empty;
+            return false;
+        }
+
+        var method = match.Groups["method"].Value;
+        var args = match.Groups["args"].Value.Trim();
+
+        converted = method switch
+        {
+            "getItem" => $"SharedPreferences.getInstance().then((prefs) => prefs.getString({args}))",
+            "setItem" => $"SharedPreferences.getInstance().then((prefs) => prefs.setString({args}))",
+            "removeItem" => $"SharedPreferences.getInstance().then((prefs) => prefs.remove({args}))",
+            "clear" => "SharedPreferences.getInstance().then((prefs) => prefs.clear())",
+            _ => $"// localStorage.{method} not supported"
+        };
+
+        converted += ";";
+        requiresJson = true;
+        return true;
+    }
+
+    private static bool TryConvertArrayMethod (string line, HashSet<string> stateNames, ref bool requiresJson, out string converted)
+    {
+        var match = ArrayMethodRegex().Match(line);
+        if (!match.Success)
+        {
+            converted = string.Empty;
+            return false;
+        }
+
+        var target = match.Groups["name"].Value.Replace(".value", string.Empty, StringComparison.Ordinal);
+        var method = match.Groups["method"].Value;
+
+        converted = method switch
+        {
+            "map" => $"{target}.map",
+            "filter" => $"{target}.where",
+            "find" => $"{target}.firstWhere",
+            "forEach" => $"{target}.forEach",
+            "reduce" => $"{target}.fold",
+            "some" => $"{target}.any",
+            "every" => $"{target}.every",
+            "includes" => $"{target}.contains",
+            "join" => $"{target}.join",
+            "split" => $"{target}.split",
+            "slice" => $"{target}.sublist",
+            "indexOf" => $"{target}.indexOf",
+            "sort" => $"{target}..sort",
+            "reverse" => $"{target}.reversed.toList",
+            "flatMap" => $"{target}.expand",
+            "splice" => $"{target}.removeRange",
+            _ => $"{target}.{method}"
+        };
+
+        if (line.EndsWith(';') && !converted.EndsWith(';'))
+            converted += ";";
+
+        return true;
+    }
+
+    private static string ConvertStatementSimple (string statement)
+    {
+        var line = statement.Trim().TrimEnd(';');
+        if (line.Length == 0) return string.Empty;
+
+        line = line.Replace(".value", string.Empty, StringComparison.Ordinal);
+        line = line.Replace("===", "==", StringComparison.Ordinal)
+                   .Replace("!==", "!=", StringComparison.Ordinal);
+        line = line.Replace("console.log", "debugPrint", StringComparison.Ordinal);
+
+        if (line.StartsWith("debugPrint(") && !line.EndsWith(".toString());"))
+        {
+            var closeParen = line.LastIndexOf(')');
+            if (closeParen > 0)
+                line = line[..closeParen] + ".toString())";
+        }
+
+        return line + ";";
+    }
+
     private static string ConvertExpression (string expression, HashSet<string> stateNames, ref bool requiresJson)
     {
         var value = NormalizeOperators(ReplaceRefAccess(ConvertTemplate(expression.Trim()), stateNames));
@@ -557,6 +824,34 @@ public sealed partial class TypeScriptLogicBridge : ILogicBridge
         {
             value = Regex.Replace(value, "(?:await\\s+)?(?<r>[A-Za-z_]\\w*)\\.text\\(\\)", "${r}.body");
         }
+
+        value = NewDateRegex().Replace(value, match =>
+        {
+            var args = match.Groups["args"].Value.Trim();
+            return string.IsNullOrWhiteSpace(args)
+                ? "DateTime.now()"
+                : $"DateTime.parse({args})";
+        });
+
+        value = MathMethodRegex().Replace(value, match =>
+        {
+            var method = match.Groups["method"].Value;
+            return method switch
+            {
+                "random" => "Random().nextDouble()",
+                "pow" => "pow",
+                _ => $"import 'dart:math'; {method}"
+            };
+        });
+
+        value = ParseIntRegex().Replace(value, "int.parse(${1})");
+        value = ParseFloatRegex().Replace(value, "double.parse(${1})");
+
+        if (value.Contains("new Date()", StringComparison.Ordinal))
+            value = value.Replace("new Date()", "DateTime.now()", StringComparison.Ordinal);
+
+        if (value.Contains("document.", StringComparison.Ordinal))
+            value = $"// Not available in Flutter: {value}";
 
         return value;
     }
@@ -805,7 +1100,7 @@ public sealed partial class TypeScriptLogicBridge : ILogicBridge
 
     private static string ResolveInitializer (string rawValue, string dartType)
     {
-        var value = rawValue.Trim();
+        var value = rawValue.Trim().TrimEnd(';');
         if (value.Length == 0)
         {
             return DefaultValueForType(dartType);
